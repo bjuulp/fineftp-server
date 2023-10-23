@@ -130,7 +130,8 @@ namespace fineftp
                        , const std::shared_ptr<WriteableFile>&     file
                        , const std::function<void(void)>&          fetch_more = []() {return; });
 
-    void endDataReceiving(const std::shared_ptr<WriteableFile>& file);
+    void endDataReceiving(const std::shared_ptr<WriteableFile>& file
+                        , const std::shared_ptr<asio::ip::tcp::socket>& data_socket);
 
   ////////////////////////////////////////////////////////
   // Helpers
