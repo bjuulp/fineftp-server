@@ -29,8 +29,7 @@ namespace fineftp
     , command_strand_       (io_service)
     , data_type_binary_     (false)
     , data_acceptor_        (io_service)
-    , data_buffer_strand_   (io_service)
-    , file_rw_strand_       (io_service)
+    , data_socket_strand_   (io_service)
     , ftp_working_directory_("/")
   {
   }
@@ -42,18 +41,20 @@ namespace fineftp
 #endif // !NDEBUG
 
     {
-      // Properly close command socket
-      // TODO: Protect command socket with a mutex, as it may be accessed by multiple threads
+      // Properly close command socket.
+      // When the FtpSession is being destroyed, there are no std::shared_ptr's referring to
+      // it and hence no possibility of race conditions on command_socket_.
       asio::error_code ec;
       command_socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
       command_socket_.close(ec);
     }
 
+    // When the FtpSession is being destroyed, there are no std::shared_ptr's referring to
+    // it and hence no possibility of race conditions on data_socket_weak_ptr_.
     auto data_socket = data_socket_weakptr_.lock();
     if (data_socket)
     {
       // Properly close data socket
-      // TODO: Protect data socket with a mutex, as it may be accessed by multiple threads
       asio::error_code ec;
       data_socket->shutdown(asio::ip::tcp::socket::shutdown_both, ec);
       data_socket->close(ec);
@@ -68,8 +69,8 @@ namespace fineftp
     command_socket_.set_option(asio::ip::tcp::no_delay(true), ec);
     if (ec) std::cerr << "Unable to set socket option tcp::no_delay: " << ec.message() << std::endl;
 
+    command_strand_.post([me = shared_from_this()]() { me->readFtpCommand(); });
     sendFtpMessage(FtpMessage(FtpReplyCode::SERVICE_READY_FOR_NEW_USER, "Welcome to fineFTP Server"));
-    readFtpCommand();
   }
 
   asio::ip::tcp::socket& FtpSession::getSocket()
@@ -154,8 +155,11 @@ namespace fineftp
                               auto data_socket = me->data_socket_weakptr_.lock();
                               if (data_socket)
                               {
-                                asio::error_code ec_;
-                                data_socket->close(ec_);
+                                me->data_socket_strand_.post([me, data_socket]()
+                                                             {
+                                                               asio::error_code ec_;
+                                                               data_socket->close(ec_);
+                                                             });
                               }
                             }
 
@@ -250,10 +254,9 @@ namespace fineftp
     if (last_command_ == "QUIT")
     {
       // Close command socket
-      command_strand_.wrap([me = shared_from_this()]()
+      command_strand_.post([me = shared_from_this()]()
                             {
                               // Properly close command socket
-                              // TODO: Protect command socket with a mutex, as it may be accessed by multiple threads
                               asio::error_code ec;
                               me->command_socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
                               me->command_socket_.close(ec);
@@ -1257,7 +1260,7 @@ namespace fineftp
 
   void FtpSession::addDataToBufferAndSend(const std::shared_ptr<std::vector<char>>& data, const std::shared_ptr<asio::ip::tcp::socket>& data_socket)
   {
-    data_buffer_strand_.post([me = shared_from_this(), data, data_socket]()
+    data_socket_strand_.post([me = shared_from_this(), data, data_socket]()
                             {
                               const bool write_in_progress = (!me->data_buffer_.empty());
 
@@ -1272,7 +1275,7 @@ namespace fineftp
 
   void FtpSession::writeDataToSocket(const std::shared_ptr<asio::ip::tcp::socket>& data_socket)
   {
-    data_buffer_strand_.post(
+    data_socket_strand_.post(
                     [me = shared_from_this(), data_socket]()
                     {
                       auto data = me->data_buffer_.front();
@@ -1282,7 +1285,7 @@ namespace fineftp
                         // Send out the buffer
                         asio::async_write(*data_socket
                                           , asio::buffer(*data)
-                                          , me->data_buffer_strand_.wrap([me, data_socket, data](asio::error_code ec, std::size_t /*bytes_to_transfer*/)
+                                          , me->data_socket_strand_.wrap([me, data_socket, data](asio::error_code ec, std::size_t /*bytes_to_transfer*/)
                                             {
                                               me->data_buffer_.pop_front();
 
@@ -1305,7 +1308,6 @@ namespace fineftp
                         me->data_buffer_.pop_front();
 
                         // Close Data Socket properly
-                        // TODO: Protect data socket with mutex, as it may be accessed from multiple threads
                         {
                           asio::error_code ec;
                           data_socket->shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -1347,7 +1349,7 @@ namespace fineftp
     asio::async_read(*data_socket
                     , asio::buffer(*buffer)
                     , asio::transfer_at_least(buffer->size())
-                    , file_rw_strand_.wrap([me = shared_from_this(), file, data_socket, buffer](asio::error_code ec, std::size_t length)
+                    , data_socket_strand_.wrap([me = shared_from_this(), file, data_socket, buffer](asio::error_code ec, std::size_t length)
                       {
                         buffer->resize(length);
                         if (ec)
@@ -1375,7 +1377,7 @@ namespace fineftp
 
   void FtpSession::endDataReceiving(const std::shared_ptr<WriteableFile>& file)
   {
-    file_rw_strand_.post([me = shared_from_this(), file]()
+    data_socket_strand_.post([me = shared_from_this(), file]()
                         {
                           file->close();
                           me->sendFtpMessage(FtpReplyCode::CLOSING_DATA_CONNECTION, "Done");
